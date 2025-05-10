@@ -102,15 +102,13 @@ CONTAINS
   !------------------------------------------------------------------------
   subroutine Init(this, bounds)
 
-    use clm_varctl     , only : use_fates, use_fates_nocomp
+    use clm_varctl     , only : use_fates, use_fates_sp
     class(drydepvel_type) :: this
     type(bounds_type), intent(in) :: bounds
 
-    if (use_fates .and. (n_drydep > 0)) then    
-       if (.not. use_fates_nocomp) then
-          call endrun( msg='ERROR: Dry-deposition currently only works with when FATES is in SP and/or NOCOMP mode '//&
+    if ( (.not. use_fates_sp) .and. use_fates .and. (n_drydep > 0) ) then
+       call endrun( msg='ERROR: Dry-deposition currently does NOT work with FATES outside of FATES-SP mode (see github issue #1044)'//&
                     errMsg(sourcefile, __LINE__))
-       end if
     end if
     call this%InitAllocate(bounds)
     call this%InitHistory(bounds)
@@ -286,13 +284,13 @@ CONTAINS
 
     if ( n_drydep == 0 ) return
 
-    associate(                                                    &
-         forc_solad =>    atm2lnd_inst%forc_solad_grc           , & ! Input:  [real(r8) (:,:) ] direct beam radiation (visible only)
+    associate(                                                    & 
+         forc_solai =>    atm2lnd_inst%forc_solai_grc           , & ! Input:  [real(r8) (:,:) ] direct beam radiation (visible only)
+         forc_solad =>    atm2lnd_inst%forc_solad_downscaled_col, & ! Input:  [real(r8) (:,:) ] direct beam radiation (visible only)
          forc_t     =>    atm2lnd_inst%forc_t_downscaled_col    , & ! Input:  [real(r8) (:)   ] downscaled atmospheric temperature (Kelvin)
          forc_q     =>    wateratm2lndbulk_inst%forc_q_downscaled_col    , & ! Input:  [real(r8) (:)   ] downscaled atmospheric specific humidity (kg/kg)
          forc_pbot  =>    atm2lnd_inst%forc_pbot_downscaled_col , & ! Input:  [real(r8) (:)   ] downscaled surface pressure (Pa)
          forc_rain  =>    wateratm2lndbulk_inst%forc_rain_downscaled_col , & ! Input:  [real(r8) (:)   ] downscaled rain rate [mm/s]
-
          h2osoi_vol =>    waterstatebulk_inst%h2osoi_vol_col        , & ! Input:  [real(r8) (:,:) ] volumetric soil water (0<=h2osoi_vol<=watsat)
          snow_depth =>    waterdiagnosticbulk_inst%snow_depth_col        , & ! Input:  [real(r8) (:)   ] snow height (m)
 
@@ -326,7 +324,7 @@ CONTAINS
             spec_hum   = forc_q(c)
             rain       = forc_rain(c)
             sfc_temp   = forc_t(c)
-            solar_flux = forc_solad(g,1)
+            solar_flux = forc_solad(c,1)
             lat        = grc%latdeg(g)
             lon        = grc%londeg(g)
             clmveg     = patch%itype(pi)

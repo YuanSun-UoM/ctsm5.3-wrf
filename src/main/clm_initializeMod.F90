@@ -14,10 +14,10 @@ module clm_initializeMod
   use clm_varctl            , only : use_fates_sp, use_fates_bgc, use_fates
   use clm_varctl            , only : is_cold_start
   use clm_varctl            , only : iulog
-  use clm_varctl            , only : use_lch4, use_cn, use_cndv, use_c13, use_c14, use_fates, use_fates_nocomp
+  use clm_varctl            , only : use_lch4, use_cn, use_cndv, use_c13, use_c14, nhillslope
   use clm_varctl            , only : use_soil_moisture_streams
   use clm_instur            , only : wt_lunit, urban_valid, wt_nat_patch, wt_cft, fert_cft
-  use clm_instur            , only : irrig_method, wt_glc_mec, topo_glc_mec, haslake, pct_urban_max
+  use clm_instur            , only : irrig_method, wt_glc_mec, topo_glc_mec, pct_lake_max, pct_urban_max, ncolumns_hillslope
   use perf_mod              , only : t_startf, t_stopf
   use readParamsMod         , only : readParameters
   use ncdio_pio             , only : file_desc_t
@@ -41,6 +41,7 @@ module clm_initializeMod
   public :: initialize2  ! Phase two initialization
 
   integer :: actual_numcft  ! numcft from sfc dataset
+  integer :: actual_nlevurb ! nlevurb from sfc dataset
   integer :: actual_numpft  ! numpft from sfc dataset
 
 !-----------------------------------------------------------------------
@@ -57,14 +58,15 @@ contains
     use clm_varcon           , only: clm_varcon_init
     use landunit_varcon      , only: landunit_varcon_init
     use clm_varctl           , only: fsurdat, version
-    use surfrdMod            , only: surfrd_get_num_patches
+    use surfrdMod            , only: surfrd_get_num_patches, surfrd_get_nlevurb, surfrd_compat_check
     use controlMod           , only: control_init, control_print, NLFilename
     use ncdio_pio            , only: ncd_pio_init
     use initGridCellsMod     , only: initGridCells
     use UrbanParamsType      , only: IsSimpleBuildTemp
     use dynSubgridControlMod , only: dynSubgridControl_init
     use SoilBiogeochemDecompCascadeConType , only : decomp_cascade_par_init
-    use CropReprPoolsMod         , only: crop_repr_pools_init
+    use CropReprPoolsMod     , only: crop_repr_pools_init
+    use HillslopeHydrologyMod, only: hillslope_properties_init
     !
     ! !ARGUMENTS
     integer, intent(in) :: dtime    ! model time step (seconds)
@@ -98,7 +100,9 @@ contains
 
     call control_init(dtime)
     call ncd_pio_init()
+    call surfrd_compat_check(fsurdat)
     call surfrd_get_num_patches(fsurdat, actual_maxsoil_patches, actual_numpft, actual_numcft)
+    call surfrd_get_nlevurb(fsurdat, actual_nlevurb)
 
     ! If fates is on, we override actual_maxsoil_patches. FATES dictates the
     ! number of patches per column.  We still use numcft from the surface
@@ -107,34 +111,37 @@ contains
        call CLMFatesGlobals1(actual_numpft, actual_numcft, actual_maxsoil_patches)
     end if
 
-    call clm_varpar_init(actual_maxsoil_patches, actual_numpft, actual_numcft)
+    call clm_varpar_init(actual_maxsoil_patches, actual_numpft, actual_numcft, actual_nlevurb)
     call decomp_cascade_par_init( NLFilename )
     call clm_varcon_init( IsSimpleBuildTemp() )
     call landunit_varcon_init()
     if (masterproc) call control_print()
     call dynSubgridControl_init(NLFilename)
     call crop_repr_pools_init()
+    call hillslope_properties_init(NLFilename)
 
     call t_stopf('clm_init1')
 
   end subroutine initialize1
 
   !-----------------------------------------------------------------------
-  subroutine initialize2(ni,nj)
+  subroutine initialize2(ni,nj, currtime)
     !
     ! !DESCRIPTION:
     ! CLM initialization second phase
     !
     ! !USES:
+    use ESMF                          , only : ESMF_Time
     use clm_varcon                    , only : spval
     use clm_varpar                    , only : natpft_lb, natpft_ub, cft_lb, cft_ub, maxpatch_glc
     use clm_varpar                    , only : surfpft_lb, surfpft_ub
     use clm_varpar                    , only : nlevsno
     use clm_varpar                    , only : natpft_size,cft_size
-    use clm_varctl                    , only : fsurdat
-    use clm_varctl                    , only : finidat, finidat_interp_source, finidat_interp_dest, fsurdat
-    use clm_varctl                    , only : use_cn, use_fates
+    use clm_varctl                    , only : fsurdat, hillslope_file
+    use clm_varctl                    , only : finidat, finidat_interp_source, finidat_interp_dest
+    use clm_varctl                    , only : use_cn, use_fates, use_fates_luh
     use clm_varctl                    , only : use_crop, ndep_from_cpl, fates_spitfire_mode
+    use clm_varctl                    , only : use_hillslope
     use clm_varorb                    , only : eccen, mvelpp, lambm0, obliqr
     use clm_varctl                    , only : use_cropcal_streams
     use landunit_varcon               , only : landunit_varcon_init, max_lunit, numurbl
@@ -142,7 +149,7 @@ contains
     use decompInitMod                 , only : decompInit_clumps, decompInit_glcp
     use domainMod                     , only : domain_check, ldomain, domain_init
     use surfrdMod                     , only : surfrd_get_data
-    use controlMod                    , only : NLFilename
+    use controlMod                    , only : NLFilename, fluh_timeseries
     use initGridCellsMod              , only : initGridCells
     use ch4varcon                     , only : ch4conrd
     use UrbanParamsType               , only : UrbanInput, IsSimpleBuildTemp
@@ -169,15 +176,18 @@ contains
     use SatellitePhenologyMod         , only : SatellitePhenologyInit, readAnnualVegetation, interpMonthlyVeg, SatellitePhenology
     use SnowSnicarMod                 , only : SnowAge_init, SnowOptics_init
     use lnd2atmMod                    , only : lnd2atm_minimal
-    use controlMod                    , only : NLFilename
+    use controlMod                    , only : NLFilename, check_missing_initdata_status
     use clm_instMod                   , only : clm_fates
     use BalanceCheckMod               , only : BalanceCheckInit
     use CNSharedParamsMod             , only : CNParamsSetSoilDepth
     use NutrientCompetitionFactoryMod , only : create_nutrient_competition_method
     use FATESFireFactoryMod           , only : scalar_lightning
+    use dynFATESLandUseChangeMod      , only : dynFatesLandUseInit
+    use HillslopeHydrologyMod         , only : InitHillslope
     !
     ! !ARGUMENTS
-    integer, intent(in) :: ni, nj                ! global grid sizes
+    integer, intent(in) :: ni, nj         ! global grid sizes
+    type(ESMF_Time), intent(in) :: currtime
     !
     ! !LOCAL VARIABLES:
     integer            :: c,g,i,j,k,l,n,p ! indices
@@ -234,8 +244,11 @@ contains
     allocate (irrig_method (begg:endg, cft_lb:cft_ub       ))
     allocate (wt_glc_mec   (begg:endg, maxpatch_glc     ))
     allocate (topo_glc_mec (begg:endg, maxpatch_glc     ))
-    allocate (haslake      (begg:endg                      ))
+    allocate (pct_lake_max (begg:endg                      ))
     allocate (pct_urban_max(begg:endg, numurbl             ))
+    if (use_hillslope) then
+       allocate (ncolumns_hillslope  (begg:endg            ))
+    endif
     allocate (wt_nat_patch (begg:endg, surfpft_lb:surfpft_ub ))
 
     ! Read list of Patches and their corresponding parameter values
@@ -243,7 +256,7 @@ contains
     call pftcon%Init()
 
     ! Read surface dataset and set up subgrid weight arrays
-    call surfrd_get_data(begg, endg, ldomain, fsurdat, actual_numcft)
+    call surfrd_get_data(begg, endg, ldomain, fsurdat, hillslope_file, actual_numcft)
 
     if(use_fates) then
 
@@ -292,6 +305,11 @@ contains
     ! Set global seg maps for gridcells, landlunits, columns and patches
     call decompInit_glcp(ni, nj, glc_behavior)
 
+    if (use_hillslope) then
+       ! Initialize hillslope properties
+       call InitHillslope(bounds_proc, hillslope_file)
+    endif
+
     ! Set filters
     call allocFilters()
 
@@ -316,7 +334,8 @@ contains
     ! Some things are kept until the end of initialize2; urban_valid is kept through the
     ! end of the run for error checking, pct_urban_max is kept through the end of the run
     ! for reweighting in subgridWeights.
-    deallocate (wt_lunit, wt_cft, wt_glc_mec, haslake)
+    deallocate (wt_lunit, wt_cft, wt_glc_mec, pct_lake_max)
+    if (use_hillslope)  deallocate (ncolumns_hillslope)
 
     ! Determine processor bounds and clumps for this processor
     call get_proc_bounds(bounds_proc)
@@ -328,10 +347,12 @@ contains
          source=create_nutrient_competition_method(bounds_proc))
     call readParameters(photosyns_inst)
 
+    
     ! Initialize time manager
     if (nsrest == nsrStartup) then
        call timemgr_init()
     else
+       call timemgr_init(curr_date_in=currtime)
        call restFile_getfile(file=fnamer, path=pnamer)
        call restFile_open( flag='read', file=fnamer, ncid=ncid )
        call timemgr_restart_io( ncid=ncid, flag='read' )
@@ -406,6 +427,11 @@ contains
     call dynSubgrid_init(bounds_proc, glc_behavior, crop_inst)
     call t_stopf('init_dyn_subgrid')
 
+    ! Initialize fates LUH2 usage
+    if (use_fates_luh) then
+       call dynFatesLandUseInit(bounds_proc, fluh_timeseries)
+    end if
+
     ! Initialize baseline water and energy states needed for dynamic subgrid operation
     ! This will be overwritten by the restart file, but needs to be done for a cold start
     ! case.
@@ -455,14 +481,11 @@ contains
 
     else ! FATES OR Satellite phenology
 
-       ! For FATES-SP or FATES-NOCOMP Initialize SP
+       ! For SP FATES-SP Initialize SP
        ! Also for FATES with Dry-Deposition on as well (see above)
-       ! For now don't allow for dry-deposition with full fates 
-       ! because of issues in #1044 EBK Jun/17/2022
-       if( use_fates_nocomp .or. (.not. use_fates )) then
-          if (masterproc) then
-             write(iulog,'(a)')'Initializing Satellite Phenology'
-          end if
+       !if(use_fates_sp .or. (.not.use_cn) .or. (n_drydep > 0) )then  !  Replace with this when we have dry-deposition working
+       ! For now don't allow for dry-deposition because of issues in #1044 EBK Jun/17/2022
+       if( use_fates_sp .or. .not. use_fates )then
           call SatellitePhenologyInit(bounds_proc)
        end if
 
@@ -502,17 +525,7 @@ contains
        else
           if (trim(finidat) == trim(finidat_interp_dest)) then
              ! Check to see if status file for finidat exists
-             klen = len_trim(finidat_interp_dest) - 3 ! remove the .nc
-             locfn = finidat_interp_dest(1:klen)//'.status'
-             inquire(file=trim(locfn), exist=lexists)
-             if (.not. lexists) then
-                if (masterproc) then
-                   write(iulog,'(a)')' failed to find file '//trim(locfn)
-                   write(iulog,'(a)')' this indicates a problem in creating '//trim(finidat_interp_dest)
-                   write(iulog,'(a)')' remove '//trim(finidat_interp_dest)//' and try again'
-                end if
-                call endrun()
-             end if
+             call check_missing_initdata_status(finidat_interp_dest)
           end if
           if (masterproc) then
              write(iulog,'(a)')'Reading initial conditions from file '//trim(finidat)
@@ -641,19 +654,21 @@ contains
     end if
 
     ! Initialize crop calendars
-    call t_startf('init_cropcal')
-    call cropcal_init(bounds_proc)
-    if (use_cropcal_streams) then
-      call cropcal_advance( bounds_proc )
-      !$OMP PARALLEL DO PRIVATE (nc, bounds_clump)
-      do nc = 1,nclumps
-         call get_clump_bounds(nc, bounds_clump)
-         call cropcal_interp(bounds_clump, filter_inactive_and_active(nc)%num_pcropp, &
-              filter_inactive_and_active(nc)%pcropp, crop_inst)
-      end do
-      !$OMP END PARALLEL DO
+    if (use_crop) then
+      call t_startf('init_cropcal')
+      call cropcal_init(bounds_proc)
+      if (use_cropcal_streams) then
+        call cropcal_advance( bounds_proc )
+        !$OMP PARALLEL DO PRIVATE (nc, bounds_clump)
+        do nc = 1,nclumps
+           call get_clump_bounds(nc, bounds_clump)
+           call cropcal_interp(bounds_clump, filter_inactive_and_active(nc)%num_pcropp, &
+                filter_inactive_and_active(nc)%pcropp, .true., crop_inst)
+        end do
+        !$OMP END PARALLEL DO
+      end if
+      call t_stopf('init_cropcal')
     end if
-    call t_stopf('init_cropcal')
 
     ! Initialize active history fields.
     ! This is only done if not a restart run. If a restart run, then this
@@ -689,9 +704,9 @@ contains
        ! Call interpMonthlyVeg for dry-deposition so that mlaidiff will be calculated
        ! This needs to be done even if FATES, CN or CNDV is on!
        call interpMonthlyVeg(bounds_proc, canopystate_inst)
+    ! If fates has satellite phenology enabled, get the monthly veg values
+    ! prior to the first call to SatellitePhenology()
     elseif ( use_fates_sp ) then
-       ! If fates has satellite phenology enabled, get the monthly veg values
-       ! prior to the first call to SatellitePhenology()
        call interpMonthlyVeg(bounds_proc, canopystate_inst)
     end if
     

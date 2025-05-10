@@ -16,7 +16,7 @@ module histFileMod
   use clm_varctl     , only : iulog, use_fates, compname, use_cn, use_crop
   use clm_varcon     , only : spval, ispval
   use clm_varcon     , only : grlnd, nameg, namel, namec, namep
-  use decompMod      , only : get_proc_bounds, get_proc_global, bounds_type, get_global_index_array
+  use decompMod      , only : get_proc_bounds, get_proc_global, bounds_type, get_global_index, get_global_index_array
   use decompMod      , only : subgrid_level_gridcell, subgrid_level_landunit, subgrid_level_column
   use GridcellType   , only : grc
   use LandunitType   , only : lun
@@ -27,9 +27,10 @@ module histFileMod
   use FatesInterfaceTypesMod , only : nlevsclass, nlevage, nlevcoage
   use FatesInterfaceTypesMod , only : nlevheight
   use FatesInterfaceTypesMod , only : nlevdamage
-  use FatesLitterMod        , only : nfsc
-  use FatesLitterMod    , only : ncwd
-  use PRTGenericMod     , only : num_elements_fates  => num_elements
+  use FatesConstantsMod      , only : n_landuse_cats
+  use FatesFuelClassesMod    , only : num_fuel_classes
+  use FatesLitterMod         , only : ncwd
+  use PRTGenericMod          , only : num_elements_fates  => num_elements
   use FatesInterfaceTypesMod , only : numpft_fates => numpft
   use ncdio_pio
 
@@ -90,6 +91,7 @@ module histFileMod
 
   character(len=max_namlen+2), public :: &
        hist_fincl1(max_flds) = ' '       ! namelist: list of fields to include in history tape 1
+                                         !            aka 'h0' history file.
   character(len=max_namlen+2), public :: &
        hist_fincl2(max_flds) = ' '       ! namelist: list of fields to include in history tape 2
   character(len=max_namlen+2), public :: &
@@ -115,6 +117,7 @@ module histFileMod
 
   character(len=max_namlen+2), public :: &
        hist_fexcl1(max_flds) = ' ' ! namelist: list of fields to exclude from history tape 1
+                                   !           aka 'h0' history file.
   character(len=max_namlen+2), public :: &
        hist_fexcl2(max_flds) = ' ' ! namelist: list of fields to exclude from history tape 2
   character(len=max_namlen+2), public :: &
@@ -144,7 +147,7 @@ module histFileMod
   public :: hist_addfld1d        ! Add a 1d single-level field to the list of all history fields
   public :: hist_addfld2d        ! Add a 2d multi-level field to the list of all history fields
   public :: hist_addfld_decomp   ! Add a 1d/2d field based on patch or column data
-  public :: hist_add_subscript   ! Add a 2d subscript dimension
+
 
   public :: hist_printflds       ! Print summary of list of all history fields
   public :: htapes_fieldlist     ! Finalize history file field lists, intersecting allhistfldlist with
@@ -179,7 +182,7 @@ module histFileMod
   private :: hist_set_snow_field_2d    ! Set values in history field dimensioned by levsno
   private :: list_index                ! Find index of field in exclude list
   private :: set_hist_filename         ! Determine history dataset filenames
-  private :: getname                   ! Retrieve name portion of input "inname"
+  public  :: getname                   ! Retrieve name portion of input "inname" (PUBLIC FOR FATES)
   private :: getflag                   ! Retrieve flag
   private :: next_history_pointer_index ! Latest index into raw history data (clmptr_r*) arrays
   private :: max_nFields               ! The max number of fields on any tape
@@ -193,10 +196,6 @@ module histFileMod
                                                   ! is 255. But this can't be increased until all hard
                                                   ! coded values throughout the i/o stack are updated.
   integer, parameter :: max_chars = 199        ! max chars for char variables
-  integer, parameter :: max_subs = 100         ! max number of subscripts
-  integer            :: num_subs = 0           ! actual number of subscripts
-  character(len=32)  :: subs_name(max_subs)    ! name of subscript
-  integer            :: subs_dim(max_subs)     ! dimension of subscript
 
   ! type2d value for a field without a level dimension. This value is important for the
   ! following reasons (as of 2023-08-21):
@@ -253,8 +252,11 @@ module histFileMod
   end interface
 
   ! Additional per-field metadata. See also history_entry. 
-  ! These values are specified in hist_addfld* calls but then can be
-  ! overridden by namelist params like hist_fincl1.
+  ! For the primary history tape, some fields are enabled here (inside hist_addfld* 
+  ! call)  but then can be overridden by namelist params (like hist_fincl1). The
+  ! fields for other history tapes are theoretically settable here but in
+  ! practice are all disabled.  Fields for those tapes have to be specified
+  ! explicitly and manually via hist_fincl2 et al.
   type, extends(entry_base) :: allhistfldlist_entry
      logical :: actflag(max_tapes)  ! which history tapes to write to. 
      character(len=avgflag_strlen) :: avgflag(max_tapes)  ! type of time averaging
@@ -304,8 +306,8 @@ module histFileMod
   type (clmpoint_ra) :: clmptr_ra(max_mapflds) ! Real array data (2D)
   !
   ! History field metadata including which history tapes (if any) it should be output to, and
-  ! type of accumulation to perform. The field ordering is arbitrary, depending on the order of
-  ! hist_addfld* calls in the code.
+  ! type of accumulation to perform. This list contains all possible fields, and their field ordering 
+  ! is arbitrary, as it depends on the order of hist_addfld* calls in the code.
   ! For the field data itself, see 'tape'.
   !
   type (allhistfldlist_entry) :: allhistfldlist(max_flds)  ! list of all history fields
@@ -338,7 +340,7 @@ module histFileMod
   type(file_desc_t), target :: nfid(max_tapes)       ! file ids
   type(file_desc_t), target :: ncid_hist(max_tapes)  ! file ids for history restart files
   integer :: time_dimid                      ! time dimension id
-  integer :: hist_interval_dimid             ! time bounds dimension id
+  integer :: nbnd_dimid                      ! time bounds dimension id
   integer :: strlen_dimid                    ! string dimension id
   !
   ! Time Constant variable names and filename
@@ -1169,6 +1171,7 @@ contains
     integer :: beg1d,end1d          ! beginning and ending indices for this field (assume already set)
     integer :: num1d_out            ! history output 1d size
     type(bounds_type) :: bounds
+    character(len=avgflag_strlen) :: avgflag_temp  ! local copy of hist_avgflag_pertape(t)
     character(len=*),parameter :: subname = 'htape_addfld'
     !-----------------------------------------------------------------------
 
@@ -1297,6 +1300,19 @@ contains
        tape(t)%hlist(n)%avgflag = allhistfldlist(f)%avgflag(t)
     else
        tape(t)%hlist(n)%avgflag = avgflag
+    end if
+
+    ! Override this tape's avgflag if nhtfrq == 1
+    if (tape(t)%nhtfrq == 1) then  ! output is instantaneous
+       hist_avgflag_pertape(t) = 'I'
+    end if
+    ! Override this field's avgflag if the namelist or the previous line
+    ! has set this tape to
+    ! - instantaneous (I) or
+    ! - local time (L)
+    avgflag_temp = hist_avgflag_pertape(t)
+    if (avgflag_temp == 'I' .or. avgflag_temp(1:1) == 'L') then
+       tape(t)%hlist(n)%avgflag = avgflag_temp
     end if
 
   end subroutine htape_addfld
@@ -2327,7 +2343,9 @@ contains
     use clm_varpar      , only : natpft_size, cft_size, maxpatch_glc, nlevdecomp_full, mxsowings, mxharvests
     use landunit_varcon , only : max_lunit
     use clm_varctl      , only : caseid, ctitle, fsurdat, finidat, paramfile
+    use clm_varctl      , only : hillslope_file
     use clm_varctl      , only : version, hostname, username, conventions, source
+    use clm_varctl      , only : use_hillslope,nhillslope,max_columns_hillslope
     use domainMod       , only : ldomain
     use fileutils       , only : get_filename
     !
@@ -2426,6 +2444,8 @@ contains
     call ncd_putatt(lnfid, ncd_global, 'case_id', trim(caseid))
     str = get_filename(fsurdat)
     call ncd_putatt(lnfid, ncd_global, 'Surface_dataset', trim(str))
+    str = get_filename(hillslope_file)
+    call ncd_putatt(lnfid, ncd_global, 'Hillslope_dataset', trim(str))
     if (finidat == ' ') then
        str = 'arbitrary initialization'
     else
@@ -2465,6 +2485,10 @@ contains
     call ncd_defdim(lnfid, 'ltype', max_lunit, dimid)
     call ncd_defdim(lnfid, 'nlevcan',nlevcan, dimid)
     call ncd_defdim(lnfid, 'nvegwcs',nvegwcs, dimid)
+    if (use_hillslope) then
+       call ncd_defdim(lnfid, 'nhillslope',nhillslope, dimid)
+       call ncd_defdim(lnfid, 'max_columns_hillslope',max_columns_hillslope, dimid)
+    endif
     call ncd_defdim(lnfid, 'mxsowings' , mxsowings , dimid)
     call ncd_defdim(lnfid, 'mxharvests' , mxharvests , dimid)
     call htape_add_ltype_metadata(lnfid)
@@ -2479,13 +2503,9 @@ contains
     ! (although on the history file it will go 1:(nec+1) rather than 0:nec)
     call ncd_defdim(lnfid, 'elevclas' , maxpatch_glc + 1, dimid)
 
-    do n = 1,num_subs
-       call ncd_defdim(lnfid, subs_name(n), subs_dim(n), dimid)
-    end do
     call ncd_defdim(lnfid, 'string_length', hist_dim_name_length, strlen_dimid)
     call ncd_defdim(lnfid, 'scale_type_string_length', scale_type_strlen, dimid)
     call ncd_defdim( lnfid, 'levdcmp', nlevdecomp_full, dimid)
-
 
     if(use_fates)then
        call ncd_defdim(lnfid, 'fates_levscag', nlevsclass * nlevage, dimid)
@@ -2496,7 +2516,7 @@ contains
        call ncd_defdim(lnfid, 'fates_levpft', numpft_fates, dimid)
        call ncd_defdim(lnfid, 'fates_levage', nlevage, dimid)
        call ncd_defdim(lnfid, 'fates_levheight', nlevheight, dimid)
-       call ncd_defdim(lnfid, 'fates_levfuel', nfsc, dimid)
+       call ncd_defdim(lnfid, 'fates_levfuel', num_fuel_classes, dimid)
        call ncd_defdim(lnfid, 'fates_levcwdsc', ncwd, dimid)
        call ncd_defdim(lnfid, 'fates_levscpf', nlevsclass*numpft_fates, dimid)
        call ncd_defdim(lnfid, 'fates_levcapf', nlevcoage*numpft_fates, dimid)
@@ -2511,12 +2531,14 @@ contains
        call ncd_defdim(lnfid, 'fates_levelpft', num_elements_fates * numpft_fates, dimid)
        call ncd_defdim(lnfid, 'fates_levelcwd', num_elements_fates * ncwd, dimid)
        call ncd_defdim(lnfid, 'fates_levelage', num_elements_fates * nlevage, dimid)
-       call ncd_defdim(lnfid, 'fates_levagefuel', nlevage * nfsc, dimid)
+       call ncd_defdim(lnfid, 'fates_levagefuel', nlevage * num_fuel_classes, dimid)
        call ncd_defdim(lnfid, 'fates_levclscpf', nclmax*nlevsclass*numpft_fates, dimid)
+       call ncd_defdim(lnfid, 'fates_levlanduse', n_landuse_cats, dimid)
+       call ncd_defdim(lnfid, 'fates_levlulu', n_landuse_cats * n_landuse_cats, dimid)
     end if
 
     if ( .not. lhistrest )then
-       call ncd_defdim(lnfid, 'hist_interval', 2, hist_interval_dimid)
+       call ncd_defdim(lnfid, 'nbnd', 2, nbnd_dimid)
        call ncd_defdim(lnfid, 'time', ncd_unlimited, time_dimid)
        if (masterproc)then
           write(iulog,*) trim(subname), &
@@ -2650,7 +2672,7 @@ contains
     ! !DESCRIPTION:
     ! Write time constant 3D variables to history tapes.
     ! Only write out when this subroutine is called (normally only for
-    ! primary history files at very first time-step, nstep=0).
+    ! primary history files at very first time-step, nstep=1).
     ! Issue the required netcdf wrapper calls to define the history file
     ! contents.
     !
@@ -2727,6 +2749,7 @@ contains
          'lake', &  ! ZLAKE
          'lake'  &  ! DZLAKE
          ]
+
     !-----------------------------------------------------------------------
 
     SHR_ASSERT_ALL_FL((ubound(watsat_col)   == (/bounds%endc, nlevmaxurbgrnd/)), sourcefile, __LINE__)
@@ -3021,7 +3044,8 @@ contains
     !
     ! !USES:
     use clm_varpar      , only : nlevsoi
-    use clm_varcon      , only : zsoi, zlak, secspday, isecspday, isecsphr, isecspmin
+    use clm_varctl      , only : use_hillslope
+    use clm_varcon      , only : zsoi, zlak, secspday, isecspday, isecsphr, isecspmin, ispval
     use domainMod       , only : ldomain, lon1d, lat1d
     use clm_time_manager, only : get_nstep, get_curr_date, get_curr_time
     use clm_time_manager, only : get_ref_date, get_calendar, NO_LEAP_C, GREGORIAN_C
@@ -3065,6 +3089,7 @@ contains
     use FatesInterfaceTypesMod, only : fates_hdim_scmap_levcdpf
     use FatesInterfaceTypesMod, only : fates_hdim_cdmap_levcdpf
     use FatesInterfaceTypesMod, only : fates_hdim_pftmap_levcdpf
+    use FatesInterfaceTypesMod, only : fates_hdim_levlanduse
 
 
     !
@@ -3075,7 +3100,7 @@ contains
     !
     integer :: sec_hist_nhtfrq            ! hist_nhtfrq converted to seconds
     ! !LOCAL VARIABLES:
-    integer :: vid,n,i,j,m                ! indices
+    integer :: vid,n,i,j,m,c              ! indices
     integer :: nstep                      ! current step
     integer :: mcsec                      ! seconds of current date
     integer :: mdcur                      ! current day
@@ -3083,6 +3108,7 @@ contains
     integer :: mcdate                     ! current date
     integer :: yr,mon,day,nbsec           ! year,month,day,seconds components of a date
     integer :: hours,minutes,secs         ! hours,minutes,seconds of hh:mm:ss
+    character(len= 12) :: step_or_bounds  ! string used in long_name of several time variables
     character(len= 10) :: basedate        ! base date (yyyymmdd)
     character(len=  8) :: basesec         ! base seconds
     character(len=  8) :: cdate           ! system date
@@ -3101,12 +3127,18 @@ contains
     real(r8), pointer :: histo(:,:)       ! temporary
     integer :: status
     real(r8) :: zsoi_1d(1)
+    type(bounds_type) :: bounds
+    integer :: ier                        ! error status
+    integer, pointer :: icarr(:)          ! temporary
     character(len=*),parameter :: subname = 'htape_timeconst'
     !-----------------------------------------------------------------------
 
     !-------------------------------------------------------------------------------
     !***     Time constant grid variables only on first time-sample of file ***
     !-------------------------------------------------------------------------------
+
+    call get_proc_bounds(bounds)
+
 
     if (tape(t)%ntimes == 1) then
        if (mode == 'define') then
@@ -3121,6 +3153,36 @@ contains
                long_name='coordinate lake levels', units='m', ncid=nfid(t))
           call ncd_defvar(varname='levdcmp', xtype=tape(t)%ncprec, dim1name='levdcmp', &
                long_name='coordinate levels for soil decomposition variables', units='m', ncid=nfid(t))
+
+          if (use_hillslope .and. .not.tape(t)%dov2xy)then
+             call ncd_defvar(varname='hillslope_distance', xtype=ncd_double, &
+                  dim1name=namec, long_name='hillslope column distance', &
+                  units='m', ncid=nfid(t))             
+             call ncd_defvar(varname='hillslope_width', xtype=ncd_double, &
+                  dim1name=namec, long_name='hillslope column width', &
+                  units='m', ncid=nfid(t))             
+             call ncd_defvar(varname='hillslope_area', xtype=ncd_double, &
+                  dim1name=namec, long_name='hillslope column area', &
+                  units='m2', ncid=nfid(t))
+             call ncd_defvar(varname='hillslope_elev', xtype=ncd_double, &
+                  dim1name=namec, long_name='hillslope column elevation', &
+                  units='m', ncid=nfid(t))             
+             call ncd_defvar(varname='hillslope_slope', xtype=ncd_double, &
+                  dim1name=namec, long_name='hillslope column slope', &
+                  units='m/m', ncid=nfid(t))
+             call ncd_defvar(varname='hillslope_aspect', xtype=ncd_double, &
+                  dim1name=namec, long_name='hillslope column aspect', &
+                  units='radians', ncid=nfid(t))
+             call ncd_defvar(varname='hillslope_index', xtype=ncd_int, &
+                  dim1name=namec, long_name='hillslope index', &
+                  ncid=nfid(t))             
+             call ncd_defvar(varname='hillslope_cold', xtype=ncd_int, &
+                  dim1name=namec, long_name='hillslope downhill column index', &
+                  ncid=nfid(t))             
+             call ncd_defvar(varname='hillslope_colu', xtype=ncd_int, &
+                  dim1name=namec, long_name='hillslope uphill column index', &
+                  ncid=nfid(t))             
+          end if
 
           if(use_fates)then
 
@@ -3193,6 +3255,8 @@ contains
                   long_name='FATES pft index of the combined damage-size-PFT dimension', ncid=nfid(t))
              call ncd_defvar(varname='fates_levcdam', xtype=tape(t)%ncprec, dim1name='fates_levcdam', &
                   long_name='FATES damage class lower bound', units='unitless', ncid=nfid(t))
+             call ncd_defvar(varname='fates_levlanduse',xtype=ncd_int, dim1name='fates_levlanduse', &
+                   long_name='FATES land use label', ncid=nfid(t))
 
           end if
 
@@ -3208,6 +3272,44 @@ contains
              zsoi_1d(1) = 1._r8
              call ncd_io(varname='levdcmp', data=zsoi_1d, ncid=nfid(t), flag='write')
           end if
+
+          if (use_hillslope .and. .not.tape(t)%dov2xy) then
+             call ncd_io(varname='hillslope_distance' , data=col%hill_distance, dim1name=namec, ncid=nfid(t), flag='write')
+             call ncd_io(varname='hillslope_width' , data=col%hill_width, dim1name=namec, ncid=nfid(t), flag='write')
+             call ncd_io(varname='hillslope_area' , data=col%hill_area, dim1name=namec, ncid=nfid(t), flag='write')
+             call ncd_io(varname='hillslope_elev' , data=col%hill_elev, dim1name=namec, ncid=nfid(t), flag='write')
+             call ncd_io(varname='hillslope_slope' , data=col%hill_slope, dim1name=namec, ncid=nfid(t), flag='write')
+             call ncd_io(varname='hillslope_aspect' , data=col%hill_aspect, dim1name=namec, ncid=nfid(t), flag='write')
+             call ncd_io(varname='hillslope_index' , data=col%hillslope_ndx, dim1name=namec, ncid=nfid(t), flag='write')
+
+             ! write global indices rather than local indices
+             allocate(icarr(bounds%begc:bounds%endc),stat=ier)
+             if (ier /= 0) then
+                call endrun(msg=' allocation error of icarr'//errMsg(sourcefile, __LINE__))
+             end if
+
+             do c = bounds%begc,bounds%endc
+                if (col%cold(c) /= ispval) then 
+                   icarr(c)= get_global_index(subgrid_index=col%cold(c), subgrid_level=subgrid_level_column)
+                else
+                   icarr(c)= col%cold(c)
+                endif
+             enddo
+             
+             call ncd_io(varname='hillslope_cold' , data=icarr, dim1name=namec, ncid=nfid(t), flag='write')
+
+             do c = bounds%begc,bounds%endc
+                if (col%colu(c) /= ispval) then 
+                   icarr(c)= get_global_index(subgrid_index=col%colu(c), subgrid_level=subgrid_level_column)
+                else
+                   icarr(c)= col%colu(c)
+                endif
+             enddo
+
+             call ncd_io(varname='hillslope_colu' , data=icarr, dim1name=namec, ncid=nfid(t), flag='write')
+             deallocate(icarr)
+          endif
+
           if(use_fates)then
              call ncd_io(varname='fates_scmap_levscag',data=fates_hdim_scmap_levscag, ncid=nfid(t), flag='write')
              call ncd_io(varname='fates_agmap_levscag',data=fates_hdim_agmap_levscag, ncid=nfid(t), flag='write')
@@ -3242,6 +3344,7 @@ contains
              call ncd_io(varname='fates_scmap_levcdpf',data=fates_hdim_scmap_levcdpf, ncid=nfid(t), flag='write')
              call ncd_io(varname='fates_cdmap_levcdpf',data=fates_hdim_cdmap_levcdpf, ncid=nfid(t), flag='write')
              call ncd_io(varname='fates_pftmap_levcdpf',data=fates_hdim_pftmap_levcdpf, ncid=nfid(t), flag='write')
+             call ncd_io(varname='fates_levlanduse',data=fates_hdim_levlanduse, ncid=nfid(t), flag='write')
           end if
 
        endif
@@ -3265,8 +3368,18 @@ contains
 
        dim1id(1) = time_dimid
        str = 'days since ' // basedate // " " // basesec
-       call ncd_defvar(nfid(t), 'time', tape(t)%ncprec, 1, dim1id, varid, &
-            long_name='time',units=str)
+       if (hist_avgflag_pertape(t) /= 'I') then  ! NOT instantaneous fields tape
+          step_or_bounds = 'time_bounds'
+          long_name = 'time at exact middle of ' // step_or_bounds
+          call ncd_defvar(nfid(t), 'time', tape(t)%ncprec, 1, dim1id, varid, &
+               long_name=long_name, units=str)
+          call ncd_putatt(nfid(t), varid, 'bounds', 'time_bounds')
+       else  ! instantaneous fields tape
+          step_or_bounds = 'time step'
+          long_name = 'time at end of ' // step_or_bounds
+          call ncd_defvar(nfid(t), 'time', tape(t)%ncprec, 1, dim1id, varid, &
+               long_name=long_name, units=str)
+       end if
        cal = get_calendar()
        if (      trim(cal) == NO_LEAP_C   )then
           caldesc = "noleap"
@@ -3274,11 +3387,12 @@ contains
           caldesc = "gregorian"
        end if
        call ncd_putatt(nfid(t), varid, 'calendar', caldesc)
-       call ncd_putatt(nfid(t), varid, 'bounds', 'time_bounds')
 
        dim1id(1) = time_dimid
+       long_name = 'current date (YYYYMMDD) at end of ' // step_or_bounds
        call ncd_defvar(nfid(t) , 'mcdate', ncd_int, 1, dim1id , varid, &
-          long_name = 'current date (YYYYMMDD)')
+          long_name = long_name)
+       call ncd_putatt(nfid(t), varid, 'calendar', caldesc)
        !
        ! add global attribute time_period_freq
        !
@@ -3305,18 +3419,28 @@ contains
        call ncd_putatt(nfid(t), ncd_global, 'time_period_freq',          &
                           trim(time_period_freq))
 
+       long_name = 'current seconds of current date at end of ' // step_or_bounds
        call ncd_defvar(nfid(t) , 'mcsec' , ncd_int, 1, dim1id , varid, &
-          long_name = 'current seconds of current date', units='s')
+          long_name = long_name, units='s')
+       call ncd_putatt(nfid(t), varid, 'calendar', caldesc)
+       long_name = 'current day (from base day) at end of ' // step_or_bounds
        call ncd_defvar(nfid(t) , 'mdcur' , ncd_int, 1, dim1id , varid, &
-          long_name = 'current day (from base day)')
+          long_name = long_name)
+       call ncd_putatt(nfid(t), varid, 'calendar', caldesc)
+       long_name = 'current seconds of current day at end of ' // step_or_bounds
        call ncd_defvar(nfid(t) , 'mscur' , ncd_int, 1, dim1id , varid, &
-          long_name = 'current seconds of current day')
+          long_name = long_name)
+       call ncd_putatt(nfid(t), varid, 'calendar', caldesc)
        call ncd_defvar(nfid(t) , 'nstep' , ncd_int, 1, dim1id , varid, &
           long_name = 'time step')
 
-       dim2id(1) = hist_interval_dimid;  dim2id(2) = time_dimid
-       call ncd_defvar(nfid(t), 'time_bounds', ncd_double, 2, dim2id, varid, &
-          long_name = 'history time interval endpoints')
+       dim2id(1) = nbnd_dimid;  dim2id(2) = time_dimid
+       if (hist_avgflag_pertape(t) /= 'I') then  ! NOT instantaneous fields tape
+          call ncd_defvar(nfid(t), 'time_bounds', ncd_double, 2, dim2id, varid, &
+             long_name = 'time interval endpoints', &
+             units = str)
+          call ncd_putatt(nfid(t), varid, 'calendar', caldesc)
+       end if
 
        dim2id(1) = strlen_dimid;  dim2id(2) = time_dimid
        call ncd_defvar(nfid(t), 'date_written', ncd_char, 2, dim2id, varid)
@@ -3344,12 +3468,15 @@ contains
        call ncd_io('mscur' , mscur , 'write', nfid(t), nt=tape(t)%ntimes)
        call ncd_io('nstep' , nstep , 'write', nfid(t), nt=tape(t)%ntimes)
 
-       time = mdcur + mscur/secspday
+       timedata(1) = tape(t)%begtime  ! beginning time
+       timedata(2) = mdcur + mscur/secspday  ! end time
+       if (hist_avgflag_pertape(t) /= 'I') then  ! NOT instantaneous fields tape
+          time = (timedata(1) + timedata(2)) * 0.5_r8
+          call ncd_io('time_bounds', timedata, 'write', nfid(t), nt=tape(t)%ntimes)
+       else
+          time = timedata(2)
+       end if
        call ncd_io('time'  , time  , 'write', nfid(t), nt=tape(t)%ntimes)
-
-       timedata(1) = tape(t)%begtime
-       timedata(2) = time
-       call ncd_io('time_bounds', timedata, 'write', nfid(t), nt=tape(t)%ntimes)
 
        call getdatetime (cdate, ctime)
        call ncd_io('date_written', cdate, 'write', nfid(t), nt=tape(t)%ntimes)
@@ -3418,17 +3545,6 @@ contains
               imissing_value=ispval, ifill_value=ispval)
        end if
        if (ldomain%isgrid2d) then
-          call ncd_defvar(varname='pftmask' , xtype=ncd_int, &
-              dim1name='lon', dim2name='lat', &
-              long_name='pft real/fake mask (0.=fake and 1.=real)', ncid=nfid(t), &
-              imissing_value=ispval, ifill_value=ispval)
-       else
-          call ncd_defvar(varname='pftmask' , xtype=ncd_int, &
-              dim1name=grlnd, &
-              long_name='pft real/fake mask (0.=fake and 1.=real)', ncid=nfid(t), &
-              imissing_value=ispval, ifill_value=ispval)
-       end if
-       if (ldomain%isgrid2d) then
           call ncd_defvar(varname='nbedrock' , xtype=ncd_int, &
               dim1name='lon', dim2name='lat', &
               long_name='index of shallowest bedrock layer', ncid=nfid(t), &
@@ -3455,7 +3571,6 @@ contains
        call ncd_io(varname='area'    , data=ldomain%area, dim1name=grlnd, ncid=nfid(t), flag='write')
        call ncd_io(varname='landfrac', data=ldomain%frac, dim1name=grlnd, ncid=nfid(t), flag='write')
        call ncd_io(varname='landmask', data=ldomain%mask, dim1name=grlnd, ncid=nfid(t), flag='write')
-       call ncd_io(varname='pftmask' , data=ldomain%pftm, dim1name=grlnd, ncid=nfid(t), flag='write')
        call ncd_io(varname='nbedrock' , data=grc%nbedrock, dim1name=grlnd, ncid=nfid(t), flag='write')
 
     end if  ! (define/write mode
@@ -3758,6 +3873,9 @@ contains
           call ncd_defvar(varname='cols1d_active', xtype=ncd_log, dim1name=namec, &
                long_name='true => do computations on this column', ifill_value=0, ncid=ncid)
 
+          call ncd_defvar(varname='cols1d_nbedrock', xtype=ncd_int, dim1name=namec, &
+               long_name='column bedrock depth index', ifill_value=ispval, ncid=ncid)
+
           ! Define patch info
 
           call ncd_defvar(varname='pfts1d_lon', xtype=ncd_double, dim1name=namep, &
@@ -3905,6 +4023,7 @@ contains
        call ncd_io(varname='cols1d_itype_lunit', data=icarr    , dim1name=namec, ncid=ncid, flag='write')
 
        call ncd_io(varname='cols1d_active' , data=col%active  , dim1name=namec, ncid=ncid, flag='write')
+       call ncd_io(varname='cols1d_nbedrock', data=col%nbedrock , dim1name=namec, ncid=ncid, flag='write')
 
        ! Write patch info
 
@@ -4053,12 +4172,6 @@ contains
           cycle
        end if
 
-       ! Skip nstep=0 if monthly average
-
-       if (nstep==0 .and. tape(t)%nhtfrq==0) then
-          cycle
-       end if
-
        ! Determine if end of history interval
        tape(t)%is_endhist = .false.
        if (tape(t)%nhtfrq==0) then   !monthly average
@@ -4100,7 +4213,7 @@ contains
              call htape_timeconst(t, mode='define')
 
              ! Define 3D time-constant field variables on first history tapes
-             if ( do_3Dtconst) then
+             if ( do_3Dtconst .and. t == 1) then
                 call htape_timeconst3D(t, &
                      bounds, watsat_col, sucsat_col, bsw_col, hksat_col, &
                      cellsand_col, cellclay_col, mode='define')
@@ -4120,7 +4233,7 @@ contains
           call htape_timeconst(t, mode='write')
 
           ! Write 3D time constant history variables to first history tapes
-          if ( do_3Dtconst .and. tape(t)%ntimes == 1 )then
+          if ( do_3Dtconst .and. t == 1 .and. tape(t)%ntimes == 1 )then
              call htape_timeconst3D(t, &
                   bounds, watsat_col, sucsat_col, bsw_col, hksat_col, &
                   cellsand_col, cellclay_col, mode='write')
@@ -4573,7 +4686,6 @@ contains
        max_nflds = max_nFields()
 
        start(1)=1
-
 
        !
        ! Add history namelist data to each history restart tape
@@ -5514,7 +5626,7 @@ contains
     case ('fates_levheight')
        num2d = nlevheight
     case ('fates_levfuel')
-       num2d = nfsc
+       num2d = num_fuel_classes
     case ('fates_levcwdsc')
        num2d = ncwd
     case ('fates_levscpf')
@@ -5554,9 +5666,13 @@ contains
     case ('fates_levelage')
        num2d = num_elements_fates*nlevage
     case ('fates_levagefuel')
-       num2d = nlevage*nfsc
+       num2d = nlevage*num_fuel_classes
     case('fates_levclscpf')
        num2d = nclmax * nclmax * numpft_fates
+    case ('fates_levlanduse')
+       num2d = n_landuse_cats
+    case ('fates_levlulu')
+       num2d = n_landuse_cats * n_landuse_cats
     case('cft')
        if (cft_size > 0) then
           num2d = cft_size
@@ -5852,31 +5968,6 @@ contains
     endif
 
   end function next_history_pointer_index
-
-  !-----------------------------------------------------------------------
-  subroutine hist_add_subscript(name, dim)
-    !
-    ! !DESCRIPTION:
-    ! Add a history variable to the output history tape.
-    !
-    ! !ARGUMENTS:
-    character(len=*), intent(in) :: name ! name of subscript
-    integer         , intent(in) :: dim  ! dimension of subscript
-    !
-    ! !LOCAL VARIABLES:
-    character(len=*),parameter :: subname = 'hist_add_subscript'
-    !-----------------------------------------------------------------------
-
-    num_subs = num_subs + 1
-    if (num_subs > max_subs) then
-       write(iulog,*) trim(subname),' ERROR: ',&
-            ' num_subs = ',num_subs,' greater than max_subs= ',max_subs
-       call endrun(msg=errMsg(sourcefile, __LINE__))
-    endif
-    subs_name(num_subs) = name
-    subs_dim(num_subs) =  dim
-
-  end subroutine hist_add_subscript
 
   !-----------------------------------------------------------------------
 
